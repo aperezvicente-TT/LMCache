@@ -8,6 +8,7 @@ _EXPORT_TO_MODULE = {
     "BufferAllocator": "buffer_allocator",
     "CuFileMemoryAllocator": "cu_file_memory_allocator",
     "DevDaxMemoryAllocator": "devdax_memory_allocator",
+    "ExternalBufferMemoryAllocator": "external_buffer_allocator",
     "GPUMemoryAllocator": "gpu_memory_allocator",
     "HipFileMemoryAllocator": "hip_file_memory_allocator",
     "HostMemoryAllocator": "host_memory_allocator",

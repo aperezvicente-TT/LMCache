@@ -2,7 +2,7 @@
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 import asyncio
 import os
 import threading
@@ -44,7 +44,10 @@ class LocalDiskWorker:
         self, loop: asyncio.AbstractEventLoop, max_workers: int = _DEFAULT_THREAD_COUNT
     ) -> None:
         self.put_lock = threading.Lock()
-        self.put_tasks: List[CacheEngineKey] = []
+        # glm53: key -> pending put count. It was a List, so insert / 'key in' / remove scanned every pending put:
+        # one 32K-token store with the disk tier behind made 198,611 CacheEngineKey.__eq__ calls on the engine
+        # thread (doc/ttnn/12-fast-start/store_path). A count keeps the list's multiset semantics in O(1).
+        self.put_tasks: Dict[CacheEngineKey, int] = {}
 
         self.prefetch_lock = threading.Lock()
         self.prefetch_tasks: dict[CacheEngineKey, Future] = {}
@@ -79,14 +82,17 @@ class LocalDiskWorker:
 
     def remove_put_task(self, key: CacheEngineKey):
         with self.put_lock:
-            if key in self.put_tasks:
-                self.put_tasks.remove(key)
+            n = self.put_tasks.get(key, 0)
+            if n > 1:
+                self.put_tasks[key] = n - 1
+            elif n == 1:
+                del self.put_tasks[key]
             else:
                 logger.warning("Key %s not found in put tasks.", key)
 
     def insert_put_task(self, key: CacheEngineKey):
         with self.put_lock:
-            self.put_tasks.append(key)
+            self.put_tasks[key] = self.put_tasks.get(key, 0) + 1
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self.put_lock:

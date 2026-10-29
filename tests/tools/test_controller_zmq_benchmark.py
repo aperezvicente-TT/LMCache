@@ -525,7 +525,7 @@ class TestIntegration:
             zmq_benchmark._normalize_heartbeat_url("10.0.0.5:7557") == "127.0.0.1:7557"
         )
         assert (
-            zmq_benchmark._normalize_heartbeat_url("192.168.1.100:7557")
+            zmq_benchmark._normalize_heartbeat_url("<host-ip>:7557")
             == "127.0.0.1:7557"
         )
         # localhost should remain unchanged
@@ -557,6 +557,6 @@ class TestIntegration:
             zmq_benchmark._normalize_heartbeat_url("10.0.0.5:7557") == "10.0.0.5:7557"
         )
         assert (
-            zmq_benchmark._normalize_heartbeat_url("192.168.1.100:7557")
-            == "192.168.1.100:7557"
+            zmq_benchmark._normalize_heartbeat_url("<host-ip>:7557")
+            == "<host-ip>:7557"
         )

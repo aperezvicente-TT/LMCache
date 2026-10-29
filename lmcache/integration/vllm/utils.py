@@ -195,6 +195,18 @@ def mla_enabled(model_config: "ModelConfig") -> bool:
     )
 
 
+def key_namespace(config) -> str:
+    """glm53 (Stage 12, program 2026-10-26T03:59:21Z DECISION 2 / 16:12:35Z B2): the LMCache KEY NAMESPACE --
+    extra_config["key_namespace"] (e.g. "#tt-tile-v2" for tile-order memory objects) is appended to the key's
+    model_name, so every tier's key (the in-memory hash, the local-disk and fs:// object names = CacheEngineKey.to_string)
+    is disjoint from another layout's: a tile-mode lookup can never read a row-major object (and vice versa). "" = off.
+    The namespace may not contain the key-string separators '@' / '%'."""
+    ns = str(((getattr(config, "extra_config", None) or {}).get("key_namespace")) or "")
+    if "@" in ns or "%" in ns:
+        raise ValueError(f"LMCache extra_config key_namespace {ns!r} contains a key separator ('@' / '%')")
+    return ns
+
+
 def create_lmcache_metadata(
     vllm_config=None,
     model_config=None,
@@ -266,7 +278,7 @@ def create_lmcache_metadata(
 
     # Create metadata
     metadata = LMCacheMetadata(
-        model_name=model_cfg.model,
+        model_name=model_cfg.model + key_namespace(config),
         world_size=parallel_cfg.world_size,
         local_world_size=parallel_cfg.world_size,
         worker_id=parallel_cfg.rank,

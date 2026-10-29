@@ -390,7 +390,7 @@ class TestRegistrationControllerInstanceMapping:
         """Test getting instance ID for unregistered IP."""
         query_msg = QueryInstMsg(
             event_id="event_123",
-            ip="192.168.1.1",
+            ip="<host-ip>",
         )
 
         result = await reg_controller.get_instance_id(query_msg)

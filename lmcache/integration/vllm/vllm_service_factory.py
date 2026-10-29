@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 # First Party
 from lmcache.integration.base_service_factory import BaseServiceFactory
+from lmcache.integration.vllm.utils import key_namespace
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
@@ -143,7 +144,7 @@ class VllmServiceFactory(BaseServiceFactory):
                 self.vllm_config
             )
         self.metadata = LMCacheMetadata(
-            model_name=model_config.model,
+            model_name=model_config.model + key_namespace(self.lmcache_config),
             world_size=parallel_config.world_size,
             local_world_size=local_world_size,
             worker_id=parallel_config.rank,

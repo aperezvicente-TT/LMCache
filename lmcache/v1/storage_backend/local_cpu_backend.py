@@ -358,6 +358,34 @@ class LocalCPUBackend(AllocatorBackendInterface):
         config: LMCacheEngineConfig,
         metadata: Optional[LMCacheMetadata] = None,
     ) -> MemoryAllocatorInterface:
+        # glm53 lever (c) step 2: the CPU tier lives in a caller-owned buffer (the TT plugin's pinned page pool) when
+        # extra_config["external_cpu_buffer"] names one ("module:fn" called with max_local_cpu_size in bytes, or a
+        # registered name); its size, not max_local_cpu_size, bounds the tier
+        # First Party
+        from lmcache.v1.memory_allocators.external_buffer_allocator import (
+            EXTRA_CONFIG_KEY,
+            ExternalBufferMemoryAllocator,
+            resolve_external_cpu_buffer,
+        )
+
+        external = resolve_external_cpu_buffer(
+            config.get_extra_config_value(EXTRA_CONFIG_KEY, None),
+            int(config.max_local_cpu_size * 1024**3),
+        )
+        if external is not None:
+            if config.enable_p2p:
+                raise ValueError("an external CPU buffer is not supported with P2P mode")
+            if external.numel() != int(config.max_local_cpu_size * 1024**3):
+                logger.warning(
+                    "LocalCPUBackend: external CPU buffer %.2f GB != max_local_cpu_size %.2f GB: "
+                    "the buffer bounds the CPU tier",
+                    external.numel() / 1024**3,
+                    config.max_local_cpu_size,
+                )
+            return ExternalBufferMemoryAllocator(
+                external, self._resolve_local_cpu_allocator_alignment(config)
+            )
+
         cpu_size = config.max_local_cpu_size
         use_hugepages = config.local_cpu_use_hugepages
 

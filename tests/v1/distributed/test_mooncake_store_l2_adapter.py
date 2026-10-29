@@ -142,7 +142,7 @@ class TestMooncakeStoreL2AdapterConfig:
         """Minimal dict with only mooncake keys should work."""
         d = {
             "type": "mooncake_store",
-            "local_hostname": "192.168.1.1",
+            "local_hostname": "<host-ip>",
             "metadata_server": "etcd://localhost:2379",
             "global_segment_size": "3221225472",
             "local_buffer_size": "1073741824",
@@ -154,7 +154,7 @@ class TestMooncakeStoreL2AdapterConfig:
         assert "type" not in config.setup_config
 
         # Mooncake keys should be forwarded as strings
-        assert config.setup_config["local_hostname"] == "192.168.1.1"
+        assert config.setup_config["local_hostname"] == "<host-ip>"
         assert config.setup_config["metadata_server"] == "etcd://localhost:2379"
         assert config.setup_config["protocol"] == "tcp"
 

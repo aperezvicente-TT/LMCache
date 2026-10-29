@@ -28,7 +28,7 @@ def _find_arg(argv: list, name: str) -> str | None:
 def test_build_argv_with_tcp_http_config():
     config = {
         "http_frontend_config": {
-            "http_host": "192.168.1.5",
+            "http_host": "<host-ip>",
             "http_port": 8085,
             "http_socket_path": None,
         },
@@ -55,7 +55,7 @@ def test_build_argv_with_tcp_http_config():
     assert nodes_json is not None
     nodes = json.loads(nodes_json)
     assert nodes == [
-        {"name": "lmcache_server", "host": "192.168.1.5", "port": "8085"},
+        {"name": "lmcache_server", "host": "<host-ip>", "port": "8085"},
     ]
 
 

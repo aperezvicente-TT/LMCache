@@ -40,7 +40,7 @@ _LEGACY_INT_KEYS = {"global_segment_size", "local_buffer_size"}
 
 # Keys whose values may contain credentials and must be
 # redacted when the setup dict is logged.
-_SENSITIVE_SETUP_KEYS = {"metadata_server", "master_server_address"}
+_SENSITIVE_SETUP_KEYS = {"metadata_server", "master_server_address", "master_server_addr"}
 
 
 def _sanitize_setup_config(
@@ -95,7 +95,7 @@ def setup_mooncake_store(
     setup_dict = config.setup_config
     try:
         # New API (Mooncake PR #1445): setup(config: dict)
-        store.setup(setup_dict)
+        rc = store.setup(setup_dict)
         logger.info("Using dict-based setup API (new)")
     except TypeError:
         # Legacy API: setup with positional arguments.
@@ -113,7 +113,14 @@ def setup_mooncake_store(
                 except (TypeError, ValueError):
                     v = 0
             args.append(v)
-        store.setup(*args)
+        rc = store.setup(*args)
+    # glm53: setup() returns an int status (0 = ok). A failed setup (e.g. the master unreachable after its 2 s
+    # timeout) used to log "setup completed successfully" and fail at the first put.
+    if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
+        raise RuntimeError(
+            f"Mooncake store setup failed: rc={rc} "
+            f"(config: {_sanitize_setup_config(setup_dict)})"
+        )
 
 
 # Prefix for keys that should be forwarded to mooncake setup.
@@ -139,6 +146,12 @@ _LEGACY_PASSTHROUGH_KEYS = {
     "protocol",
     "device_name",
     "master_server_address",
+}
+
+# Legacy key -> the dict-API key Mooncake reads (store_py.cpp / types.h)
+_LEGACY_KEY_ALIASES = {
+    "device_name": "rdma_devices",
+    "master_server_address": "master_server_addr",
 }
 
 # Default values for mooncake setup keys
@@ -275,6 +288,13 @@ class MooncakeStoreConfig:
 
         # Prefixed keys override legacy keys on conflict.
         setup.update(prefixed_setup)
+
+        # glm53: the dict API (Mooncake >= 0.3.11) reads rdma_devices / master_server_addr and ignores the legacy
+        # names, so a legacy-only config reached the default master (localhost:50051). Forward the legacy values
+        # under the new names too; the legacy names stay for the positional fallback.
+        for legacy, new in _LEGACY_KEY_ALIASES.items():
+            if legacy in setup and new not in setup:
+                setup[new] = setup[legacy]
 
         # Apply defaults for keys not provided
         for k, default_v in _SETUP_DEFAULTS.items():
@@ -481,10 +501,11 @@ class MooncakestoreConnector(RemoteConnector):
         return True
 
     async def exists(self, key: CacheEngineKey) -> bool:
-        return self.store.is_exist(key.to_string())
+        # glm53: is_exist returns 1 / 0 / a negative error code (a failed RPC is not a hit)
+        return self.store.is_exist(key.to_string()) == 1
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
-        return self.store.is_exist(key.to_string())
+        return self.store.is_exist(key.to_string()) == 1
 
     async def batched_get(
         self, keys: List[CacheEngineKey]
@@ -507,18 +528,41 @@ class MooncakestoreConnector(RemoteConnector):
     def support_batched_async_contains(self) -> bool:
         return True
 
+    def _prefix_hits(self, keys: List[CacheEngineKey]) -> int:
+        """the number of leading keys the store holds (a lookup's prefix). glm53: ONE batch_is_exist RPC for the
+        whole prefix when the binding has it (Mooncake >= 0.3.x), instead of one is_exist RPC per chunk (a 128K-token
+        hit = 1,024 chunk keys; 1M = 8,192); a negative status (a failed RPC) ends the prefix like a miss."""
+        if not keys:
+            return 0
+        num_hit_counts = 0
+        batch = getattr(self.store, "batch_is_exist", None)
+        if callable(batch):
+            for status in batch([key.to_string() for key in keys]):
+                if status != 1:
+                    break
+                num_hit_counts += 1
+            return num_hit_counts
+        for key in keys:
+            if self.store.is_exist(key.to_string()) != 1:
+                break
+            num_hit_counts += 1
+        return num_hit_counts
+
+    def support_batched_contains(self) -> bool:
+        # glm53: the engine's lookup (StorageManager.batched_contains -> RemoteBackend.batched_contains) took the base
+        # class's per-key contains() -> exists() loop: 2 x 1,024 is_exist RPCs for a 128K-token D lookup + retrieve
+        return callable(getattr(self.store, "batch_is_exist", None))
+
+    def batched_contains(self, keys: List[CacheEngineKey]) -> int:
+        return self._prefix_hits(keys)
+
     async def batched_async_contains(
         self,
         lookup_id: str,
         keys: List[CacheEngineKey],
         pin: bool = False,
     ) -> int:
-        num_hit_counts = 0
-        for key in keys:
-            if not self.store.is_exist(key.to_string()):
-                break
-            num_hit_counts += 1
-        return num_hit_counts
+        return self._prefix_hits(keys)
 
     async def _batch_get_into(
         self, keys: List[CacheEngineKey]
@@ -728,7 +772,7 @@ class MooncakestoreConnector(RemoteConnector):
             buffer_sizes.append(obj.get_size())
 
         try:
-            await asyncio.wait_for(
+            rcs = await asyncio.wait_for(
                 asyncio.to_thread(
                     self.store.batch_put_from,
                     key_strs,
@@ -738,10 +782,34 @@ class MooncakestoreConnector(RemoteConnector):
                 ),
                 timeout=self.config.transfer_timeout,
             )
+            self._note_put_rcs(key_strs, rcs)
         except asyncio.TimeoutError:
+            self.put_timeouts = getattr(self, "put_timeouts", 0) + 1
             logger.warning(
-                "Timeout during batch_put_from; some decoders may redo prefill."
+                "Timeout during batch_put_from (%d keys, transfer_timeout %s s); some decoders may redo prefill.",
+                len(key_strs),
+                self.config.transfer_timeout,
             )
+
+    def _note_put_rcs(self, key_strs: List[str], rcs: Any) -> int:
+        """glm53: batch_put_from / put_from return a status per key (0 = stored). A failed put used to be dropped
+        silently (the decoder then misses and redoes the prefill); count it and log the first one. -> failures"""
+        if isinstance(rcs, int):
+            rcs = [rcs]
+        if not isinstance(rcs, (list, tuple)):
+            return 0
+        bad = [(k, rc) for k, rc in zip(key_strs, rcs) if rc != 0]
+        if bad:
+            self.put_failed_keys = getattr(self, "put_failed_keys", 0) + len(bad)
+            logger.warning(
+                "Mooncake put failed for %d of %d keys (first %s: rc %s; %d failed so far); those chunks will miss",
+                len(bad),
+                len(key_strs),
+                bad[0][0],
+                bad[0][1],
+                self.put_failed_keys,
+            )
+        return len(bad)
 
     async def _batched_put_with_metadata(
         self,
@@ -761,7 +829,7 @@ class MooncakestoreConnector(RemoteConnector):
             buffer_ptr = memory_obj.data_ptr
             buffer_size = memory_obj.get_size()
 
-            await asyncio.wait_for(
+            rc = await asyncio.wait_for(
                 asyncio.to_thread(
                     self.store.put_from,
                     key_str,
@@ -771,7 +839,9 @@ class MooncakestoreConnector(RemoteConnector):
                 ),
                 timeout=self.config.transfer_timeout,
             )
+            self._note_put_rcs([key_str], rc)
         except asyncio.TimeoutError:
+            self.put_timeouts = getattr(self, "put_timeouts", 0) + 1
             logger.warning(
                 f"Timeout when putting key {key_str} using put_from. "
                 "Decode instance may redo prefill."

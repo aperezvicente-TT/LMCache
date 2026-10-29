@@ -49,29 +49,42 @@ class ZMQOffloadServer(OffloadServerInterface):
 
             logger = init_logger(__name__)
 
-            while self.running:
+            # J12 (glm53): a zmq socket is not thread-safe. Closing it from close() while this thread blocks in
+            # recv() trips libzmq's "pfd.revents & POLLIN" assertion and aborts the process. This thread polls with
+            # a timeout, re-checks `running`, and is the only thread that ever closes the socket.
+            poller = zmq.Poller()
+            poller.register(self.socket, zmq.POLLIN)
+            try:
+                while self.running:
+                    try:
+                        if not dict(poller.poll(100)).get(self.socket):
+                            continue
+                        frame = self.socket.recv(copy=False)
+                        offload_msg = msgspec.msgpack.decode(frame, type=OffloadMsg)
+                        result = self.offload(
+                            offload_msg.hashes,
+                            offload_msg.slot_mapping,
+                            offload_msg.offsets,
+                        )
+                        response = OffloadRetMsg(success=result)
+                        response = msgspec.msgpack.encode(response)
+                        self.socket.send(response)
+                    except zmq.ZMQError as e:
+                        if not self.running:
+                            break
+                        logger.error(f"ZMQ error in offload server: {e}")
+                        break
+                    except Exception as e:
+                        logger.error(f"Unexpected error in offload server: {e}")
+                        if not self.running:
+                            break
+            finally:
                 try:
-                    frame = self.socket.recv(copy=False)
-                    offload_msg = msgspec.msgpack.decode(frame, type=OffloadMsg)
-                    result = self.offload(
-                        offload_msg.hashes,
-                        offload_msg.slot_mapping,
-                        offload_msg.offsets,
-                    )
-                    response = OffloadRetMsg(success=result)
-                    response = msgspec.msgpack.encode(response)
-                    self.socket.send(response)
-                except zmq.ZMQError as e:
-                    # Socket was closed, exit gracefully
-                    if not self.running:
-                        logger.info("ZMQ socket closed, exiting offload server thread")
-                        break
-                    logger.error(f"ZMQ error in offload server: {e}")
-                    break
-                except Exception as e:
-                    logger.error(f"Unexpected error in offload server: {e}")
-                    if not self.running:
-                        break
+                    poller.unregister(self.socket)
+                except Exception:
+                    pass
+                self.socket.close(linger=0)
+                logger.info("ZMQ offload socket closed by its own thread")
 
         self.thread = threading.Thread(
             target=process_request, daemon=True, name="offload-server-thread"
@@ -96,25 +109,14 @@ class ZMQOffloadServer(OffloadServerInterface):
         logger = init_logger(__name__)
 
         logger.info("Closing ZMQOffloadServer...")
+        # J12: only stop the receiver; it closes the socket itself after its poll returns (<= 100 ms). Never close
+        # the socket from this thread (libzmq sockets are single-threaded).
         self.running = False
-
-        # Close socket to interrupt blocking recv()
-        try:
-            self.socket.close(linger=0)
-            logger.info("ZMQ socket closed")
-        except Exception as e:
-            logger.warning(f"Error closing ZMQ socket: {e}")
-
-        # Wait for thread with timeout to prevent deadlock
         if self.thread.is_alive():
-            logger.info("Waiting for offload server thread to finish...")
             self.thread.join(timeout=5.0)
-
             if self.thread.is_alive():
                 logger.warning(
-                    "Offload server thread did not terminate within timeout. "
-                    "Thread may be stuck in blocking recv(). "
-                    "Proceeding with shutdown anyway."
+                    "Offload server thread did not stop within 5 s; its socket stays open (closed at exit)."
                 )
             else:
                 logger.info("Offload server thread terminated successfully")

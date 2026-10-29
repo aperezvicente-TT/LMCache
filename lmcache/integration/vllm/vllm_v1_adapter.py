@@ -339,9 +339,22 @@ class ReqMeta:
         # Check if request_configs has lmcache.skip_save set to True
         request_skip = (tracker.request_configs or {}).get("lmcache.skip_save", False)
 
+        # J11 (glm53): the LAST prefill step of a prompt saves its tail (the unfull chunk) when partial chunks are
+        # kept (save_unfull_chunk), even if it does not reach the next chunk boundary - otherwise a prompt whose
+        # earlier steps already saved never stores its tail and a later request hits only the full chunks.
+        tail_save = (
+            is_last_prefill
+            and not discard_partial_chunks
+            and input_token_len > tracker.num_saved_tokens
+            and not tracker.is_decode_phase
+        )
         skip_save = tracker.disagg_spec is None and (
             tracker.skip_save
-            or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
+            or (
+                tracker.num_saved_tokens > 0
+                and input_token_len < chunk_boundary
+                and not tail_save
+            )
             or (tracker.is_decode_phase and not save_decode_cache)
             or request_skip
         )

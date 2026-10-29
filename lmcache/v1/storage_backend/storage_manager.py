@@ -233,10 +233,14 @@ class StorageManager:
         self.metadata = metadata
         self.loop = asyncio.new_event_loop()
 
+        # daemon (glm53 int27m28c2, 2026-10-22): close() stops and joins this loop on the orderly path, but a failed
+        # engine init never reaches close(); a non-daemon loop thread then parks the process in threading._shutdown
+        # forever (with the TT mesh still open: an unclean device close).
         self.thread = threading.Thread(
             target=start_loop_in_thread_with_exceptions,
             args=(self.loop,),
             name="storage-manager-event-loop",
+            daemon=True,
         )
         self.thread.start()
 

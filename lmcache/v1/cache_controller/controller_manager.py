@@ -287,7 +287,7 @@ class LMCacheControllerManager:
             worker_ip: The IP address of the requesting worker (optional)
 
         Returns:
-            A connectable URL (e.g., "192.168.1.100:8082" or "127.0.0.1:8082")
+            A connectable URL (e.g., "<host-ip>:8082" or "127.0.0.1:8082")
         """
         if ":" not in bind_url:
             return bind_url

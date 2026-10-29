@@ -68,11 +68,11 @@ def test_flags_are_parsed():
 
 def test_env_fallback(monkeypatch):
     monkeypatch.setenv("LMCACHE_COORDINATOR_URL", "http://env-coord:9300")
-    monkeypatch.setenv("LMCACHE_COORDINATOR_ADVERTISE_IP", "192.168.1.2")
+    monkeypatch.setenv("LMCACHE_COORDINATOR_ADVERTISE_IP", "<host-ip>")
     monkeypatch.setenv("LMCACHE_COORDINATOR_HEARTBEAT_INTERVAL", "3")
     config = _parse([])
     assert config.url == "http://env-coord:9300"
-    assert config.advertise_ip == "192.168.1.2"
+    assert config.advertise_ip == "<host-ip>"
     assert config.heartbeat_interval == 3.0
 
 

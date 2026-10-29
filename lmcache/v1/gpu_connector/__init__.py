@@ -228,6 +228,26 @@ def CreateGPUConnector(
             )
 
             return VLLMPagedMemHPUConnectorV2.from_metadata(metadata, use_gpu, device)
+        elif torch_device_type == "cpu":
+            # Host-driven accelerators with a CPU-only torch build (e.g.
+            # Tenstorrent via vllm-tt-plugin): the serving plugin supplies the
+            # connector class through extra_config["gpu_connector"] or
+            # LMCACHE_GPU_CONNECTOR ("module:Class").
+            # First Party
+            from lmcache.v1.gpu_connector.external import (
+                create_external_vllm_connector,
+            )
+
+            connector = create_external_vllm_connector(
+                config, metadata, use_gpu, device, layout_hints
+            )
+            if connector is not None:
+                return connector
+            raise RuntimeError(
+                "No supported cpu connector found; a host-driven accelerator "
+                "must set extra_config['gpu_connector'] (or LMCACHE_GPU_CONNECTOR) "
+                "to its 'module:Class'."
+            )
         else:
             raise RuntimeError(f"No supported {torch_device_type} connector found.")
 
