@@ -15,6 +15,7 @@ import zmq
 # First Party
 from lmcache.logging import init_logger
 from lmcache.security.api_key import APIKeyVerifier
+from lmcache.v1.client.transport.errors import MPInstanceNotRegisteredError
 from lmcache.v1.multiprocess.affinity_pool import AffinityThreadPool
 from lmcache.v1.multiprocess.request_handler import HandlerType
 from lmcache.v1.multiprocess.transport.base import RequestServer
@@ -284,12 +285,18 @@ class MessageQueueServer(RequestServer):
 
             except Exception as exc:
                 operation = decode_operation(prefix_frames[2])
-                logger.exception("Error in blocking handler %s", operation)
-                error_code = (
-                    "invalid_argument"
-                    if isinstance(exc, ValueError)
-                    else "handler_error"
-                )
+                if isinstance(exc, MPInstanceNotRegisteredError):
+                    # Expected after a reap: the typed code makes the worker
+                    # register again, so no traceback is logged.
+                    logger.warning("%s rejected: %s", operation, exc.details)
+                    error_code = exc.code
+                else:
+                    logger.exception("Error in blocking handler %s", operation)
+                    error_code = (
+                        "invalid_argument"
+                        if isinstance(exc, ValueError)
+                        else "handler_error"
+                    )
                 self.output_queue.put(
                     prefix_frames[:2]
                     + [

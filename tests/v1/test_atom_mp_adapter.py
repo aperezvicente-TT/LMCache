@@ -328,8 +328,9 @@ def test_atom_heartbeat_runs_recovery_before_publishing_health(
     assert health_event.is_set() is False
     unhealthy.assert_called_once_with()
 
+    # Recovery runs on its own thread; health is published when it ends.
     heartbeat._execute()
-    assert health_event.is_set() is True
+    assert health_event.wait(timeout=10.0)
     recover.assert_called_once_with()
 
 

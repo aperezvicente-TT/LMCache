@@ -226,6 +226,10 @@ class FakeHeartbeatThread:
         self.calls.append("stop")
         self.stop_requested = True
 
+    def request_recovery(self) -> None:
+        self.calls.append("request_recovery")
+        self.health_event.clear()
+
     def simulate_successful_ping(self) -> None:
         """Mimic one successful heartbeat cycle: on the unhealthy->healthy
         edge the recover callback runs first, and the event is set only
@@ -1446,6 +1450,104 @@ def test_heartbeat_first_ping_runs_callback_before_setting_event() -> None:
         heartbeat.stop(timeout=10.0)
 
     assert event_state_during_callback == [False]
+
+
+def test_heartbeat_keeps_pinging_while_recovery_runs() -> None:
+    """Real HeartbeatThread: recovery runs off the heartbeat thread, so pings
+    (which keep the server-side registration alive) continue while it runs,
+    and the event is set only once it succeeds."""
+    pings: list[int | None] = []
+
+    def ping(instance_id: int | None) -> MessagingFuture[bool]:
+        pings.append(instance_id)
+        future: MessagingFuture[bool] = MessagingFuture()
+        future.set_result(True)
+        return future
+
+    req_client = MagicMock(name="req_client")
+    req_client.ping.side_effect = ping
+    health_event = threading.Event()  # cleared: the first ping recovers
+    heartbeat = HeartbeatThread(
+        req_client=req_client,
+        health_event=health_event,
+        interval=0.05,
+        instance_id=7,
+    )
+    release = threading.Event()
+    recover = MagicMock(side_effect=lambda: release.wait(timeout=10.0))
+    heartbeat.register_recover_callback(recover)
+    try:
+        heartbeat.start()
+        deadline = time.time() + 10.0
+        while len(pings) < 5 and time.time() < deadline:
+            time.sleep(0.01)
+        assert len(pings) >= 5
+        assert not health_event.is_set()
+        release.set()
+        assert health_event.wait(timeout=10.0)
+    finally:
+        heartbeat.stop(timeout=10.0)
+    recover.assert_called_once_with()
+
+
+def test_heartbeat_request_recovery_reregisters_while_pings_succeed() -> None:
+    """Real HeartbeatThread: ``request_recovery`` on a healthy heartbeat
+    clears the event and runs the recover callback on the next successful
+    ping, then publishes health again."""
+    req_client = MagicMock(name="req_client")
+    req_client.ping.return_value.result.return_value = True
+    health_event = threading.Event()
+    health_event.set()
+    heartbeat = HeartbeatThread(
+        req_client=req_client,
+        health_event=health_event,
+        interval=60.0,
+        instance_id=7,
+    )
+    recovered = threading.Event()
+    event_state_during_callback: list[bool] = []
+
+    def recover() -> bool:
+        event_state_during_callback.append(health_event.is_set())
+        recovered.set()
+        return True
+
+    heartbeat.register_recover_callback(recover)
+    try:
+        heartbeat.start()
+        heartbeat.request_recovery()
+        assert recovered.wait(timeout=10.0)
+        assert health_event.wait(timeout=10.0)
+    finally:
+        heartbeat.stop(timeout=10.0)
+    assert event_state_during_callback == [False]
+
+
+def test_lost_registration_sends_worker_into_recovery(
+    fake_adapter, monkeypatch
+) -> None:
+    """When a transfer finds that the server no longer knows this worker
+    (reaped), the worker leaves the healthy state at once, so later
+    transfers are dropped instead of failing one by one, and the next
+    successful ping registers it again."""
+    adapter, _send_mock, _ = fake_adapter
+    contexts = _patch_transfer_context_factory(monkeypatch)
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+    adapter.submit_store_request("req-1", _op([[0]]), MagicMock())
+    heartbeat = FakeHeartbeatThread.instances[0]
+    assert adapter.is_healthy
+    assert len(contexts) == 1
+
+    contexts[0].on_instance_not_registered()
+
+    assert heartbeat.calls[-1] == "request_recovery"
+    assert not adapter.is_healthy
+    heartbeat.simulate_successful_ping()
+    assert adapter.is_healthy
+    assert len(contexts) == 2  # registered again with a new context
+    contexts[1].register.assert_called_once()
 
 
 def test_dropped_retrieve_reported_once_via_unhealthy_get_finished(

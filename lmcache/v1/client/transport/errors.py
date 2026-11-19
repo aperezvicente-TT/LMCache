@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Errors a request client raises when a request does not succeed."""
 
+# Standard
+from typing import Any
+
 
 class MPServerUnavailableError(TimeoutError, ConnectionError):
     """The server went away before it answered a request.
@@ -37,6 +40,29 @@ class MPRequestError(RuntimeError):
 
     def __reduce__(self) -> tuple[type, tuple[str, str]]:
         return type(self), (self.code, self.details)
+
+
+class MPInstanceNotRegisteredError(MPRequestError, ValueError):
+    """The server has no registration for the calling worker instance.
+
+    Raised when the instance never registered or was reaped after going
+    silent. Retrying the request alone cannot succeed: the worker must
+    register again. The server raises it from its transfer handlers (it is
+    a ``ValueError`` there, as before); the ZMQ client raises it when the
+    server answers with its ``code``.
+
+    Args:
+        details: The server's message.
+    """
+
+    code = "instance_not_registered"
+    """The error code the server sends for this failure."""
+
+    def __init__(self, details: str) -> None:
+        super().__init__(type(self).code, details)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return type(self), (self.details,)
 
 
 # What waiting on a request raises when it did not succeed: MPRequestError if the

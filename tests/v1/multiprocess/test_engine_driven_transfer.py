@@ -2605,6 +2605,54 @@ def test_engine_driven_context_shm_tensor_view_from_buffer() -> None:
         shm_unlink(shm_name)
 
 
+def test_engine_driven_context_shm_reuses_mapping_of_same_pool_generation() -> None:
+    """A context for the same pool name, size and generation adopts the live
+    mapping; the mapping outlives the first context and is released by the
+    last. A different generation gets its own mapping."""
+    shm_name = f"lmcache_test_reuse_{os.getpid()}"
+    addr = _create_shm_segment(shm_name, 4096)
+    metadata = EngineDrivenContextMetadata(
+        layout_desc=MemoryLayoutDesc(
+            shapes=[torch.Size([2, 4])], dtypes=[torch.float32]
+        ),
+        block_size=1,
+        use_mla=False,
+    )
+
+    def make(generation: str) -> EngineDrivenContextShm:
+        return EngineDrivenContextShm(
+            metadata=metadata,
+            req_client=MagicMock(),
+            mq_timeout=1.0,
+            shm_name=shm_name,
+            pool_size=4096,
+            pool_generation=generation,
+        )
+
+    try:
+        first = make("gen-a")
+        second = make("gen-a")
+        other = make("gen-b")
+        try:
+            src = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+            first._make_tensor_view(0, 32, [2, 4], "float32").copy_(src)
+            first.close()
+            # The adopted mapping stays valid after the first context closes.
+            assert torch.equal(second._make_tensor_view(0, 32, [2, 4], "float32"), src)
+            with patch.object(EngineDrivenContextShm, "_pin_shm_buffer") as pin:
+                third = make("gen-a")
+            pin.assert_not_called()
+            second.close()
+            third.close()
+            assert third._shm is None
+            assert torch.equal(other._make_tensor_view(0, 32, [2, 4], "float32"), src)
+        finally:
+            other.close()
+    finally:
+        shm_munmap(addr, 4096)
+        shm_unlink(shm_name)
+
+
 def test_engine_driven_context_shm_close_defers_release_past_drain_timeout() -> None:
     """A transfer still in flight after the drain timeout keeps the pool mapped:
     close() returns, and the pool is released only after the transfer ends."""

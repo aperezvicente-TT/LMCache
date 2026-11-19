@@ -18,6 +18,7 @@ from lmcache.v1.client.transfer_context.base import (
     gather_paged_kv_to_cpu,
 )
 from lmcache.v1.client.transfer_context.inline import EngineDrivenContextInline
+from lmcache.v1.client.transport.errors import MPInstanceNotRegisteredError
 from lmcache.v1.client.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
@@ -343,6 +344,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         _request_id,
                     )
                     ok = False
+                except MPInstanceNotRegisteredError as exc:
+                    self._report_transfer_failure(exc)
+                    ok = False
                 except Exception:
                     logger.exception(
                         "Async engine-driven store failed for request_id=%s",
@@ -477,6 +481,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         "context closing",
                         request_id,
                     )
+                    ok = False
+                except MPInstanceNotRegisteredError as exc:
+                    self._report_transfer_failure(exc)
                     ok = False
                 except Exception:
                     logger.exception(

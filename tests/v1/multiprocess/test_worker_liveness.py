@@ -21,6 +21,7 @@ import torch
 import zmq
 
 # First Party
+from lmcache.v1.client.transport.errors import MPInstanceNotRegisteredError
 from lmcache.v1.client.transport.factory import RequestClientFactory
 from lmcache.v1.common.attn_window import AttnWindowDesc
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
@@ -254,7 +255,7 @@ def test_non_gpu_reap_pops_strategy_as_pair() -> None:
 
 def test_non_gpu_resolve_for_transfer_refreshes_and_raises() -> None:
     """_resolve_for_transfer returns (entry, strategy) and refreshes
-    last_seen; an unknown id raises ValueError."""
+    last_seen; an unknown id raises the typed error workers re-register on."""
     module = _bare_non_gpu_module()
     module._engine_driven_contexts[1] = non_gpu_mod.EngineDrivenContextEntry(
         MagicMock(), "m", 1, 0.0, False
@@ -267,7 +268,7 @@ def test_non_gpu_resolve_for_transfer_refreshes_and_raises() -> None:
     assert entry.last_seen > 0.0
     assert entry.has_liveness_signal is False  # traffic does not latch
 
-    with pytest.raises(ValueError, match="not registered"):
+    with pytest.raises(MPInstanceNotRegisteredError, match="not registered"):
         module._resolve_for_transfer(999)
 
 

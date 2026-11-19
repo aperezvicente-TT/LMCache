@@ -166,7 +166,38 @@ T1        recover callback re-registers (id absent -> fresh context) before
 ```
 
 A shorter outage hits the NOOP register path, which refreshes `last_seen` and
-builds nothing — the server never asks a worker to re-register.
+builds nothing.
+
+The recover callback runs on a separate thread while the heartbeat keeps
+pinging. Re-registering can be slow (an engine-driven worker maps and pins the
+server's whole SHM pool), and a callback that blocked the heartbeat thread for
+longer than the reap timeout got the live, recovering worker reaped, after
+which its pings kept succeeding and it never re-registered. Stores and
+retrieves submitted while the recovery runs are dropped at once, as in any
+unhealthy state.
+
+A worker can also be reaped while its pings succeed, for example when the
+server stalls (SIGSTOP, swap) past the reap timeout without a ping timing out.
+The engine-driven transfer handlers then reject its transfers with
+`MPInstanceNotRegisteredError` (ZMQ error code `instance_not_registered`). The
+transfer context resolves the transfer as failed and calls its
+`on_instance_not_registered` hook, and the vLLM worker adapter calls
+`HeartbeatThread.request_recovery()`: it clears `health_event` and wakes the
+heartbeat, whose next successful ping re-registers.
+
+```
+T0        server stalls past the reap timeout; reaps the live worker
+T1        server resumes; pings succeed, the worker still looks healthy
+T1        next STORE -> instance_not_registered -> store dropped,
+          request_recovery() clears health_event and wakes the heartbeat
+T1+ping   recovery thread re-registers, then sets health_event
+```
+
+The register response carries `pool_generation`, unique per server lifetime.
+Engine-driven SHM contexts in one process that are given the same pool name,
+size and generation share one mapping and pin, so re-registering with the same
+server reuses the mapping instead of pinning the pool again. A restarted
+server reports a new generation and is mapped afresh.
 
 ### 6.3 Shutdown
 
@@ -174,6 +205,8 @@ Adapter shutdown stops the heartbeat before sending UNREGISTER, so no stray ping
 lands on a closing client. The heartbeat cycle skips the recover callback and
 `health_event.set()` once stopped, and the callback skips re-registration when a
 stop is already requested — a straggling cycle cannot re-create a ghost context.
+`HeartbeatThread.stop()` also waits (up to its timeout) for a running recovery
+thread, and a recovery that finishes after the stop does not publish health.
 
 ## 7. Failure Modes
 
@@ -184,5 +217,7 @@ stop is already requested — a straggling cycle cannot re-create a ghost contex
 | Worker alive but never pinged, idle past the grace | Reaped while alive only if it never pinged (heartbeat never started). Once the heartbeat is running, pings refresh `last_seen` every interval, so a live worker is never reaped regardless of traffic. |
 | Heartbeat thread starved, worker transferring | Store/retrieve/prepare/commit refresh `last_seen`; never reaped. |
 | Partition shorter than the reap window | No reap. On heal, the recover callback re-registers; the NOOP path refreshes `last_seen`; zero context churn. |
+| Server stalls past the reap window, pings never time out | The worker is reaped while it looks healthy. Its next engine-driven transfer is rejected as `instance_not_registered` and dropped, and the worker re-registers on the next ping (Section 6.2). |
+| Recovery slower than the reap timeout | Pings continue during recovery, so the worker is not reaped while it re-registers. |
 | Worker crash + restart | The new process gets a fresh uuid-derived id and a fresh entry; the dead id is reaped independently. No PID-reuse aliasing. |
 | Mixed client/server versions | Every PING fails the payload-count check; the client sits permanently unhealthy. Loud, never silent corruption; upgrade both sides together. |

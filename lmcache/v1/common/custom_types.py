@@ -256,11 +256,15 @@ class RegisterEngineDrivenContextResponse:
         pool_size: Size of that pool in bytes.
         null_block_id: Engine block ID the server treats as absent KV data.
             Workers skip storing chunks whose blocks are all this ID.
+        pool_generation: Opaque ID of this server's SHM pool, unique per
+            server lifetime, or ``""`` if unknown. Workers reuse an existing
+            mapping of the pool only when name, size and generation match.
     """
 
     shm_name: str = ""
     pool_size: int = 0
     null_block_id: int = 0
+    pool_generation: str = ""
 
 
 @dataclass

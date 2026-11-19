@@ -22,7 +22,10 @@ from lmcache.v1.client.transfer_context.base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
 )
-from lmcache.v1.client.transport.errors import MPRequestError
+from lmcache.v1.client.transport.errors import (
+    MPInstanceNotRegisteredError,
+    MPRequestError,
+)
 from lmcache.v1.client.worker_transfer import (
     EngineDrivenTransferContext,
 )
@@ -176,6 +179,39 @@ def test_failed_request_resolves_transfers_false(multigroup):
 
     assert store.result(timeout=1) is False
     assert retrieve.result(timeout=1) is False
+
+
+@pytest.mark.parametrize("multigroup", [False, True])
+def test_lost_registration_is_reported_to_the_owner(multigroup):
+    """A transfer the server rejects because it no longer knows this
+    instance resolves ``False`` like any failed request, and also calls
+    ``on_instance_not_registered`` so the owner registers again; other
+    failures do not."""
+    transfer = EngineDrivenTransferContext(1, MagicMock())
+    reports: list[int] = []
+    transfer.on_instance_not_registered = lambda: reports.append(1)
+    kv_caches = {"layer.0": torch.zeros(1)}
+
+    for failure in (
+        MPRequestError("UNKNOWN", "server error"),
+        MPInstanceNotRegisteredError("reaped"),
+    ):
+        ctx = _FakeContext()
+        ctx.prepare_store = MagicMock(side_effect=failure)
+        ctx.prepare_retrieve = MagicMock(side_effect=failure)
+        transfer._engine_driven_context = ctx
+        if multigroup:
+            transfer._group_states = [MagicMock()]
+            transfer._store_multigroup = MagicMock(side_effect=failure)
+            transfer._submit_retrieve_multigroup = MagicMock(side_effect=failure)
+
+        store = transfer.submit_store("r", object(), kv_caches, [[0]], None, 1)
+        retrieve = transfer.submit_retrieve("r", object(), kv_caches, [[0]], None, 1)
+
+        assert store.result(timeout=1) is False
+        assert retrieve.result(timeout=1) is False
+
+    assert len(reports) == 2  # store and retrieve, for the typed error only
 
 
 class _ClearedAfterFirstRead(EngineDrivenTransferContext):

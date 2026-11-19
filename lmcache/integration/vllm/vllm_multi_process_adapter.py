@@ -1629,6 +1629,7 @@ class LMCacheMPWorkerAdapter:
         """
         self.kv_caches = kv_caches
         transfer_ctx = self._create_transfer_context(kv_caches)
+        transfer_ctx.on_instance_not_registered = self._on_instance_not_registered
         layout_hints = self._layout_hints
         try:
             # Register before publishing: a context becomes visible to the
@@ -1697,10 +1698,11 @@ class LMCacheMPWorkerAdapter:
 
         The heartbeat starts healthy (the event was set at construction). A
         live worker pings every interval, refreshing its server-side
-        ``last_seen``, so it is never reaped while alive -- no re-registration
-        is needed at startup, and the first store/retrieve is not gated. The
-        recover callback still re-registers on a genuine unhealthy->healthy
-        edge (server restart).
+        ``last_seen``, so no re-registration is needed at startup, and the
+        first store/retrieve is not gated. The recover callback re-registers
+        on a genuine unhealthy->healthy edge (server restart), and after the
+        server rejects a transfer because it no longer knows this worker
+        (see ``_on_instance_not_registered``).
         """
         if self._heartbeat is not None:
             return
@@ -1726,10 +1728,16 @@ class LMCacheMPWorkerAdapter:
         heartbeat = self._heartbeat
         return heartbeat is not None and heartbeat.stop_requested
 
+    def _on_instance_not_registered(self) -> None:
+        """Re-register after the server rejected a transfer as unregistered."""
+        heartbeat = self._heartbeat
+        if heartbeat is not None:
+            heartbeat.request_recovery()
+
     def _reregister_kv_caches_callback(self) -> bool:
         """Heartbeat recover callback: re-register KV caches after the
-        server returns. Runs on the heartbeat thread, before the health
-        event is set.
+        server returns. Runs on the heartbeat's recovery thread, before the
+        health event is set.
 
         Returns:
             ``True`` if nothing needs re-registering or registration

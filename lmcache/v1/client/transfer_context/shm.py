@@ -80,8 +80,32 @@ class ShmSlotDescriptor:
         )
 
 
+@dataclass
+class _SharedPoolMapping:
+    """A pool mapping shared by this process's contexts, with its pin state."""
+
+    shm: shared_memory.SharedMemory
+    pinned: bool
+    pinned_ptr: int
+    pinned_size: int
+    refs: int = 1
+
+
+# Mappings of server pools, keyed by (shm_name, pool_size, pool_generation).
+# A context re-created for the same pool (re-registration after a server
+# blip) adopts the existing mapping instead of mapping and pinning the whole
+# pool again, which can take minutes for a large pool.
+_shared_pools: dict[tuple[str, int, str], _SharedPoolMapping] = {}
+_shared_pools_lock = threading.Lock()
+
+
 class EngineDrivenContextShm(EngineDrivenContext):
-    """Shared-memory implementation of :class:`EngineDrivenContext`."""
+    """Shared-memory implementation of :class:`EngineDrivenContext`.
+
+    Contexts in one process that are given the same pool name, size and
+    non-empty generation share one mapping and its pin; the last one closed
+    releases it.
+    """
 
     # Upper bound on how long close() waits for in-flight transfers before
     # handing the pool release to a background thread.
@@ -94,6 +118,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
         mq_timeout: float,
         shm_name: str,
         pool_size: int,
+        pool_generation: str = "",
     ) -> None:
         super().__init__(metadata, req_client, mq_timeout)
         if not shm_name or pool_size <= 0:
@@ -107,6 +132,16 @@ class EngineDrivenContextShm(EngineDrivenContext):
         self._pinned_ptr = 0
         self._pinned_size = 0
         self._release_started = False
+        self._pool_key = (
+            (shm_name, pool_size, pool_generation) if pool_generation else None
+        )
+        if self._adopt_shared_pool():
+            logger.info(
+                "Reusing SHM mapping (pinned=%s) for shm_name=%s",
+                self._pinned,
+                self._shm_name,
+            )
+            return
         try:
             self._shm = shared_memory.SharedMemory(
                 name=shm_name.lstrip("/"), create=False
@@ -125,6 +160,50 @@ class EngineDrivenContextShm(EngineDrivenContext):
             self._shm = None
             self._shm_buffer = None
             raise
+        self._share_pool()
+
+    def _adopt_shared_pool(self) -> bool:
+        """Take a reference to this process's mapping of the pool, if any."""
+        if self._pool_key is None:
+            return False
+        with _shared_pools_lock:
+            pool = _shared_pools.get(self._pool_key)
+            if pool is None:
+                return False
+            pool.refs += 1
+        self._shm = pool.shm
+        self._shm_buffer = pool.shm.buf
+        self._pinned = pool.pinned
+        self._pinned_ptr = pool.pinned_ptr
+        self._pinned_size = pool.pinned_size
+        return True
+
+    def _share_pool(self) -> None:
+        """Offer this context's fresh mapping to later contexts."""
+        if self._pool_key is None or self._shm is None:
+            return
+        with _shared_pools_lock:
+            if self._pool_key in _shared_pools:
+                # Lost a race with a concurrent context; keep a private one.
+                self._pool_key = None
+                return
+            _shared_pools[self._pool_key] = _SharedPoolMapping(
+                self._shm, self._pinned, self._pinned_ptr, self._pinned_size
+            )
+
+    def _drop_shared_ref(self) -> bool:
+        """Drop this context's reference; True if it was the last one."""
+        if self._pool_key is None:
+            return True
+        with _shared_pools_lock:
+            pool = _shared_pools.get(self._pool_key)
+            if pool is None or pool.shm is not self._shm:
+                return True
+            pool.refs -= 1
+            if pool.refs > 0:
+                return False
+            del _shared_pools[self._pool_key]
+            return True
 
     def _make_tensor_view(
         self,
@@ -330,7 +409,14 @@ class EngineDrivenContextShm(EngineDrivenContext):
         self._release_shm()
 
     def _release_shm(self) -> None:
-        """Unpin and unmap the pool. Call only once no transfer is in flight."""
+        """Unpin and unmap the pool. Call only once no transfer is in flight.
+
+        A mapping still shared with another context stays pinned and mapped.
+        """
+        if not self._drop_shared_ref():
+            self._shm = None
+            self._shm_buffer = None
+            return
         self._unpin_shm_buffer()
         try:
             if self._shm is not None:

@@ -26,7 +26,10 @@ from lmcache.v1.client.transfer_context.base import (
     scatter_cpu_to_paged_kv,
 )
 from lmcache.v1.client.transfer_context.inline import EngineDrivenContextInline
-from lmcache.v1.client.transport.errors import REQUEST_FAILURES
+from lmcache.v1.client.transport.errors import (
+    REQUEST_FAILURES,
+    MPInstanceNotRegisteredError,
+)
 from lmcache.v1.common.custom_types import (
     GroupLayout,
     RegisterEngineDrivenContextPayload,
@@ -279,6 +282,10 @@ class TransferContext(ABC):
         self._registration_request_sent = False
         self._closed = False
         self._lifecycle_lock = threading.Lock()
+        # Called when a transfer fails because the server lost this
+        # instance's registration (it was reaped, or the server restarted),
+        # so that the owner can register again.
+        self.on_instance_not_registered: Callable[[], None] | None = None
 
     def _submit_registration(
         self, submit: Callable[[], MessagingFuture[Any]]
@@ -313,6 +320,19 @@ class TransferContext(ABC):
         """Prevent future registration requests from a racing caller."""
         with self._lifecycle_lock:
             self._closed = True
+
+    def _report_transfer_failure(self, exc: Exception) -> None:
+        """Log a failed transfer and report a lost server registration.
+
+        Args:
+            exc: The failure. An ``MPInstanceNotRegisteredError`` also calls
+                ``on_instance_not_registered``, since retrying cannot succeed
+                until this instance registers again.
+        """
+        logger.warning("Transfer failed: %s", exc)
+        callback = self.on_instance_not_registered
+        if isinstance(exc, MPInstanceNotRegisteredError) and callback is not None:
+            callback()
 
     @abstractmethod
     def register(
@@ -1088,10 +1108,12 @@ class EngineDrivenTransferContext(TransferContext):
         shm_name = ""
         pool_size = 0
         null_block_id = 0
+        pool_generation = ""
         if isinstance(response, RegisterEngineDrivenContextResponse):
             shm_name = response.shm_name
             pool_size = response.pool_size
             null_block_id = response.null_block_id
+            pool_generation = response.pool_generation
         self._null_block_id = null_block_id
 
         metadata = EngineDrivenContextMetadata(
@@ -1106,6 +1128,7 @@ class EngineDrivenTransferContext(TransferContext):
             mq_timeout,
             shm_name=shm_name,
             pool_size=pool_size,
+            pool_generation=pool_generation,
         )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "inline"
         logger.info(
@@ -1196,7 +1219,7 @@ class EngineDrivenTransferContext(TransferContext):
             future.set_result(False)
             return future
         except REQUEST_FAILURES as exc:
-            logger.warning("Transfer failed: %s", exc)
+            self._report_transfer_failure(exc)
             future.set_result(False)
             return future
 
@@ -1233,7 +1256,7 @@ class EngineDrivenTransferContext(TransferContext):
                 future.set_result(False)
                 return future
             except REQUEST_FAILURES as exc:
-                logger.warning("Transfer failed: %s", exc)
+                self._report_transfer_failure(exc)
                 future.set_result(False)
                 return future
 
@@ -1281,7 +1304,7 @@ class EngineDrivenTransferContext(TransferContext):
             future.set_result(False)
             return future
         except REQUEST_FAILURES as exc:
-            logger.warning("Transfer failed: %s", exc)
+            self._report_transfer_failure(exc)
             future.set_result(False)
             return future
 
@@ -1481,7 +1504,7 @@ class EngineDrivenTransferContext(TransferContext):
             # Context is being swapped/shut down; the store is simply lost.
             ok = False
         except REQUEST_FAILURES as exc:
-            logger.warning("Transfer failed: %s", exc)
+            self._report_transfer_failure(exc)
             ok = False
         future.set_result(ok)
         return future

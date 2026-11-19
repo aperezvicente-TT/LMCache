@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 import threading
 import time
+import uuid
 
 # Third Party
 import torch
@@ -14,6 +15,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.client.transfer_context.base import EngineDrivenContextMetadata
+from lmcache.v1.client.transport.errors import MPInstanceNotRegisteredError
 from lmcache.v1.common.attn_window import AttnWindowDesc
 from lmcache.v1.common.custom_types import (
     IPCCacheServerKey,
@@ -108,6 +110,9 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         self._pending_shm_reads: dict[TransferKey, list[ObjectKey]] = {}
         self._pending_shm_lock = threading.Lock()
         self._shm_pool_info: ShmPoolInfo = self._ctx.shm_pool_info
+        # Identifies this server's SHM pool across restarts that reuse its
+        # name, so a re-registering worker can keep its existing mapping.
+        self._pool_generation = uuid.uuid4().hex
         # Values retain the START event and monotonic preparation time.
         # Includes request_id because IPCCacheServerKey equality excludes it.
         self._pending_transfers: dict[
@@ -241,14 +246,15 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             The entry and its transfer strategy.
 
         Raises:
-            ValueError: If the instance is not registered (or was reaped).
+            MPInstanceNotRegisteredError: If the instance is not registered
+                (or was reaped).
         """
         now = time.monotonic()
         with self._lock:
             entry = self._engine_driven_contexts.get(instance_id)
             strategy = self._strategies.get(instance_id)
             if entry is None or strategy is None:
-                raise ValueError(
+                raise MPInstanceNotRegisteredError(
                     "non-GPU context not registered (or reaped) for "
                     f"instance ID {instance_id}"
                 )
@@ -352,6 +358,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     shm_name=shm_name,
                     pool_size=pool_size,
                     null_block_id=self._ctx.null_block_id,
+                    pool_generation=self._pool_generation,
                 )
 
         dtype = getattr(torch, payload.dtype_str, None)
@@ -495,6 +502,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             shm_name=shm_name,
             pool_size=pool_size,
             null_block_id=self._ctx.null_block_id,
+            pool_generation=self._pool_generation,
         )
 
     @request_handler(operation="unregister_kv_cache_engine_driven_context")
