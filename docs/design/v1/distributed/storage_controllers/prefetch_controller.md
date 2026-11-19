@@ -101,7 +101,9 @@ adapter, both conditions hold:
 - `staging_bytes` is `BaseL1Manager.get_staging_memory_usage()`: buffers reserved
   but not yet admitted, i.e. loads in flight (plus in-flight stores).
 - `lookup_bytes` sums `InFlightPrefetchRequest.get_max_load_bytes()` (every
-  cell loaded from L2) over admitted requests still in `LOOKUP`. A request
+  cell a row can load from L2: all chunks of a full-attention row, at most
+  `sliding_window_size` trailing chunks of a sliding-window or recurrent-state
+  row) over admitted requests still in `LOOKUP`. A request
   reserves staging only after its lookups finish; without this charge a burst
   of submissions would all be admitted while staging still reads 0.
 - `request_bytes` is the same worst case for the head request.
@@ -110,6 +112,13 @@ adapter, both conditions hold:
 - With no request in flight the head request is admitted regardless, so a
   request that can never fit does not block the queue; its reservations then
   fail per cell as before (`l1_oom`).
+- Unless `admission_wait_s` (`--l2-prefetch-admission-wait-s`, default 0) is
+  set: then a head request with nothing in flight whose `request_bytes` fit
+  within `inflight_watermark * total_bytes` of every target L1, but not in its
+  free bytes, waits up to that long for room. The room is typically held by an
+  earlier prefetch's objects, read-locked until the engine retrieves them. A
+  request over the watermark is admitted at once, since waiting cannot help it,
+  and a request still short of room when the wait ends is admitted anyway.
 
 Condition (1) bounds how much of L1 prefetch may occupy; condition (2) keeps a
 request from starting when L1, full of resident data, could not hold its loads.

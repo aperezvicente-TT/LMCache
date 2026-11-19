@@ -71,3 +71,17 @@ def test_no_deprecation_warning_without_old_flag(config_warnings):
         "--l2-prefetch-max-in-flight" in record.getMessage()
         for record in config_warnings
     )
+
+
+def test_default_admission_wait_is_off():
+    assert parse_args(_BASE_ARGS).prefetch_admission_wait_s == 0.0
+
+
+def test_admission_wait_flag_is_plumbed():
+    config = parse_args(_BASE_ARGS + ["--l2-prefetch-admission-wait-s", "60"])
+    assert config.prefetch_admission_wait_s == 60.0
+
+
+def test_negative_admission_wait_is_rejected():
+    with pytest.raises(ValueError, match="prefetch_admission_wait_s"):
+        parse_args(_BASE_ARGS + ["--l2-prefetch-admission-wait-s", "-1"])

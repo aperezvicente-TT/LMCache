@@ -751,6 +751,12 @@ Source: ``lmcache/v1/distributed/config.py``
      - ``0.5``
      - Fraction of L1 capacity, in (0, 1], that in-flight prefetch
        (L2 load) requests may stage in L1.
+   * - ``--l2-prefetch-admission-wait-s``
+     - ``0``
+     - Seconds the next prefetch request may wait, when no other prefetch
+       is in flight, for enough free L1 to stage all of it.  Only requests
+       within ``--l2-prefetch-inflight-watermark`` of the capacity wait.
+       ``0`` starts it at once.
    * - ``--l2-prefetch-max-in-flight``
      - (none)
      - Deprecated and ignored; prefetch admission follows

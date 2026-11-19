@@ -265,6 +265,7 @@ class StorageManager:
                 adapter_descriptors=list(self._adapter_descriptors.values()),
                 policy=create_prefetch_policy(config.prefetch_policy),
                 inflight_watermark=config.prefetch_inflight_watermark,
+                admission_wait_s=config.prefetch_admission_wait_s,
             )
             self._prefetch_controller.start()
             cleanup.callback(self._prefetch_controller.stop)

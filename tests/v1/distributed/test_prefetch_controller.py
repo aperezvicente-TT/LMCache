@@ -188,6 +188,7 @@ def make_controller(
     adapters: list,
     policy: PrefetchPolicy | None = None,
     inflight_watermark: float = 0.5,
+    admission_wait_s: float = 0.0,
 ) -> PrefetchController:
     """Build a controller over one L1 manager and the given adapters."""
     return PrefetchController(
@@ -197,6 +198,7 @@ def make_controller(
         adapter_descriptors=[make_descriptor(i) for i in range(len(adapters))],
         policy=policy or BufferOnlyPrefetchPolicy(),
         inflight_watermark=inflight_watermark,
+        admission_wait_s=admission_wait_s,
     )
 
 
@@ -1054,6 +1056,165 @@ class TestAdmission:
         l1_manager.finish_read(keys)
         for key in keys:
             assert l1_manager.get_object_state(key) is None
+
+
+class TestAdmissionWait:
+    """A request admitted alone (nothing else in flight) whose loads do not
+    fit in free L1 -- e.g. while an earlier prefetch's objects still wait for
+    the engine to retrieve them -- gets a short reservation by default; with
+    ``admission_wait_s`` it waits for the room instead."""
+
+    OBJ = 100 * 2 * 512 * 2
+
+    def _setup(self, objects_free_after_fill: int, request_objects: int):
+        layout = make_layout()
+        l1_manager = DramL1Manager(
+            make_l1_config(size_in_bytes=self.OBJ * 8 + 65536, use_lazy=False)
+        )
+        fillers = [make_object_key(100 + i) for i in range(8 - objects_free_after_fill)]
+        write_keys_to_l1(l1_manager, fillers, layout)
+        # Hold them like retrieved-later prefetch objects: read-locked.
+        assert all(
+            r[0] == L1Error.SUCCESS for r in l1_manager.reserve_read(fillers).values()
+        )
+        adapter = make_adapter()
+        keys = [make_object_key(i) for i in range(request_objects)]
+        store_keys_in_l2(adapter, keys, layout)
+        return l1_manager, adapter, fillers, keys
+
+    def test_default_admits_at_once_and_misses(self):
+        """Without a wait (stock behaviour) the request starts alone, its
+        batched reservation fails, and it reports no hit."""
+        l1_manager, adapter, fillers, keys = self._setup(2, 4)
+        ctrl = make_controller(l1_manager, [adapter], inflight_watermark=0.9)
+        ctrl.start()
+        try:
+            result = wait_for_result(
+                ctrl, ctrl.submit_prefetch_request(single_row_spec(keys))
+            )
+            assert row_bits(result) == []
+        finally:
+            ctrl.stop()
+            adapter.close()
+            l1_manager.close()
+
+    def test_waits_for_room_then_hits_in_full(self):
+        """With a wait, the request stays pending (nothing in flight) until
+        the earlier objects are released, then loads every chunk."""
+        l1_manager, adapter, fillers, keys = self._setup(2, 4)
+        ctrl = make_controller(
+            l1_manager, [adapter], inflight_watermark=0.9, admission_wait_s=30.0
+        )
+        ctrl.start()
+        try:
+            req = ctrl.submit_prefetch_request(single_row_spec(keys))
+            assert wait_for_condition(
+                lambda: ctrl.report_status()["pending_queue_size"] == 1
+            ), ctrl.report_status()
+            time.sleep(1.0)
+            status = ctrl.report_status()
+            assert status["pending_queue_size"] == 1
+            assert status["in_flight_request_count"] == 0
+            assert ctrl.query_prefetch_result(req) is None
+
+            # The engine retrieves the earlier objects: they are released.
+            l1_manager.finish_read(fillers)
+            l1_manager.delete(fillers)
+            result = wait_for_result(ctrl, req, timeout=15.0)
+            assert row_bits(result) == [0, 1, 2, 3]
+            l1_manager.finish_read(keys)
+        finally:
+            ctrl.stop()
+            adapter.close()
+            l1_manager.close()
+
+    def test_wait_expires_and_request_completes(self):
+        """The wait is bounded: room that never comes admits the request
+        after ``admission_wait_s`` and it completes (here with no hit)."""
+        l1_manager, adapter, fillers, keys = self._setup(2, 4)
+        ctrl = make_controller(
+            l1_manager, [adapter], inflight_watermark=0.9, admission_wait_s=0.5
+        )
+        ctrl.start()
+        try:
+            t0 = time.monotonic()
+            result = wait_for_result(
+                ctrl, ctrl.submit_prefetch_request(single_row_spec(keys)), timeout=10.0
+            )
+            assert time.monotonic() - t0 >= 0.5
+            assert row_bits(result) == []
+        finally:
+            ctrl.stop()
+            adapter.close()
+            l1_manager.close()
+
+    def test_request_over_watermark_does_not_wait(self):
+        """A request that could never be staged within the watermark is
+        admitted at once, as before: waiting would not help it."""
+        l1_manager, adapter, fillers, keys = self._setup(2, 4)
+        # 4 objects > 0.25 x 8 objects of capacity.
+        ctrl = make_controller(
+            l1_manager, [adapter], inflight_watermark=0.25, admission_wait_s=30.0
+        )
+        ctrl.start()
+        try:
+            t0 = time.monotonic()
+            result = wait_for_result(
+                ctrl, ctrl.submit_prefetch_request(single_row_spec(keys))
+            )
+            assert time.monotonic() - t0 < 5.0
+            assert result is not None
+        finally:
+            ctrl.stop()
+            adapter.close()
+            l1_manager.close()
+
+    def test_request_that_fits_does_not_wait(self):
+        """With room in L1 the wait never applies."""
+        l1_manager, adapter, fillers, keys = self._setup(6, 4)
+        ctrl = make_controller(
+            l1_manager, [adapter], inflight_watermark=0.9, admission_wait_s=30.0
+        )
+        ctrl.start()
+        try:
+            t0 = time.monotonic()
+            result = wait_for_result(
+                ctrl, ctrl.submit_prefetch_request(single_row_spec(keys))
+            )
+            assert time.monotonic() - t0 < 5.0
+            assert row_bits(result) == [0, 1, 2, 3]
+            l1_manager.finish_read(keys)
+        finally:
+            ctrl.stop()
+            adapter.close()
+            l1_manager.close()
+
+    def test_windowed_rows_count_only_their_window(self):
+        """The admission estimate counts a sliding-window row (here
+        recurrent state, window 1) as its window, not as every chunk: a
+        request of 4 full chunks plus 4 state chunks needs 5 objects, fits
+        within the watermark and waits for room. Counted chunk by chunk it
+        would need 8 objects, more than the watermark, and start at once."""
+        l1_manager, adapter, fillers, keys = self._setup(2, 4)
+        state_keys = [make_object_key(i, gid=1) for i in range(4)]
+        store_keys_in_l2(adapter, state_keys, make_layout())
+        spec = make_spec([make_group(keys), make_group(state_keys, gid=1, window=1)])
+        ctrl = make_controller(
+            l1_manager, [adapter], inflight_watermark=0.9, admission_wait_s=30.0
+        )
+        ctrl.start()
+        try:
+            req = ctrl.submit_prefetch_request(spec)
+            assert wait_for_condition(
+                lambda: ctrl.report_status()["pending_queue_size"] == 1
+            ), ctrl.report_status()
+            time.sleep(1.0)
+            assert ctrl.report_status()["pending_queue_size"] == 1
+            assert ctrl.query_prefetch_result(req) is None
+        finally:
+            ctrl.stop()
+            adapter.close()
+            l1_manager.close()
 
 
 # =============================================================================

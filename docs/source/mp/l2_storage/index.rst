@@ -134,7 +134,10 @@ by a fixed count.  A queued prefetch request starts only when both hold:
 Many small prefetches therefore run at once, while a few large ones cannot
 fill L1.  When no prefetch is in flight, the next request always starts, so
 a request larger than the free space is served partially rather than
-waiting.  A higher watermark increases L2-to-L1 throughput but leaves less
+waiting.  ``--l2-prefetch-admission-wait-s`` lets such a request wait, up to
+the given time, for L1 to free the room (for example while the engine
+retrieves an earlier prefetch's KV cache), as long as it fits within the
+watermark.  A higher watermark increases L2-to-L1 throughput but leaves less
 L1 room for stores and resident data.
 
 .. list-table::
@@ -148,6 +151,11 @@ L1 room for stores and resident data.
      - ``0.5``
      - Fraction of L1 capacity, in (0, 1], that in-flight prefetch loads may
        stage before new prefetch requests wait.
+   * - ``--l2-prefetch-admission-wait-s``
+     - ``0``
+     - Seconds the next prefetch request may wait, when no other prefetch
+       is in flight, for enough free L1 to stage all of it.  ``0`` starts
+       it at once.
    * - ``--l2-prefetch-max-in-flight``
      - (none)
      - Deprecated and ignored; logs a warning when set.

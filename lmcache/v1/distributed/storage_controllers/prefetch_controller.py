@@ -23,6 +23,7 @@ import enum
 import itertools
 import select
 import threading
+import time
 
 # First Party
 from lmcache.lmcache_native import Bitmap
@@ -97,20 +98,30 @@ def _get_prefetch_write_tag(request_id: PrefetchRequestId) -> str:
 
 
 def _get_max_load_bytes(key_groups: list[GroupedObjectKeys]) -> int:
-    """Return the L1 staging bytes a request needs if every cell is loaded
-    from L2.
+    """Return the L1 staging bytes a request needs if every cell it can use
+    is loaded from L2.
+
+    A full-attention row can use every chunk. A sliding-window row (recurrent
+    state included) serves a prefix from only its trailing
+    ``sliding_window_size`` chunks, so at most that many of its keys are ever
+    loaded; counting all of them would overstate a long hybrid-model request
+    several times over.
 
     Args:
         key_groups: The request's rows.
 
     Returns:
-        The summed object size of every key in every row.
+        The summed object size of the keys each row can load.
     """
-    return sum(
-        len(group.keys)
-        * get_size_bytes(group.layout_desc.shapes, group.layout_desc.dtypes)
-        for group in key_groups
-    )
+    total = 0
+    for group in key_groups:
+        count = len(group.keys)
+        if group.sliding_window_size > 0:
+            count = min(count, group.sliding_window_size)
+        total += count * get_size_bytes(
+            group.layout_desc.shapes, group.layout_desc.dtypes
+        )
+    return total
 
 
 def _gather_keys(
@@ -562,6 +573,14 @@ class PrefetchController(StorageControllerInterface):
         inflight_watermark: Fraction of an L1 manager's capacity that
             in-flight prefetch requests may stage before new requests wait,
             in ``(0, 1]``.
+        admission_wait_s: How long the head of the pending queue may wait,
+            with no prefetch in flight, for L1 to free enough room to stage
+            all of it. ``0`` (the default) admits it at once; a request that
+            does not fit then gets only what its reservation can take, often
+            nothing, while the room it needed is still held by an earlier
+            prefetch's objects that the engine has not retrieved yet. Only a
+            request that fits within ``inflight_watermark`` of the capacity
+            waits; a larger one is admitted at once as before.
     """
 
     # Singleton dispatch for the in-flight load gauges: tests may construct
@@ -579,6 +598,7 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: list[L2AdapterDescriptor],
         policy: PrefetchPolicy,
         inflight_watermark: float = 0.5,
+        admission_wait_s: float = 0.0,
     ) -> None:
         self._l1_managers: dict[int, L1ManagerInterface] = {
             desc.index: mgr
@@ -602,6 +622,10 @@ class PrefetchController(StorageControllerInterface):
         }
 
         self._inflight_watermark = inflight_watermark
+        self._admission_wait_s = admission_wait_s
+        # Head-of-queue request held for L1 room with nothing in flight, and
+        # since when (monotonic seconds).
+        self._admission_wait_since: tuple[PrefetchRequestId, float] | None = None
 
         # Adapters being removed: adapter id -> event set once detached.
         self._draining: dict[int, threading.Event] = {}
@@ -788,6 +812,7 @@ class PrefetchController(StorageControllerInterface):
             "is_healthy": is_healthy,
             "thread_alive": is_healthy,
             "inflight_watermark": self._inflight_watermark,
+            "admission_wait_s": self._admission_wait_s,
             "submission_queue_size": submission_queue_size,
             "pending_queue_size": len(self._pending_queue),
             "in_flight_request_count": len(in_flight),
@@ -1134,9 +1159,10 @@ class PrefetchController(StorageControllerInterface):
         """Start pending requests in arrival order while L1 can admit the
         head of the queue (see ``_can_admit_new_prefetch``)."""
         while self._pending_queue and self._can_admit_new_prefetch(
-            self._pending_queue[0][1]
+            self._pending_queue[0][1], self._pending_queue[0][0]
         ):
             request_id, spec = self._pending_queue.popleft()
+            self._admission_wait_since = None
             try:
                 self._start_lookup_phase(request_id, spec)
             except Exception:
@@ -1145,7 +1171,9 @@ class PrefetchController(StorageControllerInterface):
                 if request is not None:
                     self._abort_request(request)
 
-    def _can_admit_new_prefetch(self, spec: PrefetchTaskSpec) -> bool:
+    def _can_admit_new_prefetch(
+        self, spec: PrefetchTaskSpec, request_id: PrefetchRequestId
+    ) -> bool:
         """Return whether the pending request ``spec`` may start now.
 
         The request can be admitted when both of the following conditions
@@ -1155,28 +1183,28 @@ class PrefetchController(StorageControllerInterface):
         2. free bytes - lookup bytes >= request bytes.
 
         With no request in flight, ``spec`` is admitted regardless, so a
-        request that can never fit does not block the queue.
+        request that can never fit does not block the queue -- unless
+        ``admission_wait_s`` is set: then a request that fits within
+        ``inflight_watermark`` of every target L1 but not in its free bytes
+        waits up to that long for the room (earlier prefetches' objects are
+        released as the engine retrieves them, and eviction frees the rest).
 
         Args:
             spec: The request at the head of the pending queue.
+            request_id: Its id, which keys the admission wait.
 
         Returns:
             True if ``spec`` may start.
         """
-        if not self._in_flight_requests:
-            return True
         request_bytes = _get_max_load_bytes(spec.key_groups)
+        if not self._in_flight_requests:
+            return self._may_start_alone(request_id, request_bytes)
         lookup_bytes = sum(
             request.get_max_load_bytes()
             for request in self._in_flight_requests.values()
             if request.phase == PrefetchPhase.LOOKUP
         )
-        target_l1_indices = {
-            self._l2_affinity[adapter_idx]
-            for adapter_idx in self._l2_adapters
-            if adapter_idx not in self._draining
-        }
-        for l1_idx in target_l1_indices:
+        for l1_idx in self._target_l1_indices():
             l1_manager = self._l1_managers[l1_idx]
             used_bytes, total_bytes = l1_manager.get_memory_usage()
             if total_bytes == 0:
@@ -1187,6 +1215,65 @@ class PrefetchController(StorageControllerInterface):
             if total_bytes - used_bytes - lookup_bytes < request_bytes:
                 return False
         return True
+
+    def _may_start_alone(
+        self, request_id: PrefetchRequestId, request_bytes: int
+    ) -> bool:
+        """Admission with nothing in flight (see ``_can_admit_new_prefetch``).
+
+        Args:
+            request_id: The head request's id.
+            request_bytes: The L1 bytes it needs to stage all of it.
+
+        Returns:
+            True if it may start now.
+        """
+        if self._admission_wait_s <= 0:
+            return True
+        fits_now = True
+        for l1_idx in self._target_l1_indices():
+            used_bytes, total_bytes = self._l1_managers[l1_idx].get_memory_usage()
+            if total_bytes == 0:
+                continue  # a shadow L1: views cost no local bytes
+            if request_bytes > self._inflight_watermark * total_bytes:
+                # Could never be staged whole: waiting would not help.
+                self._admission_wait_since = None
+                return True
+            if total_bytes - used_bytes < request_bytes:
+                fits_now = False
+        if fits_now:
+            return True
+        now = time.monotonic()
+        if self._admission_wait_since is None or (
+            self._admission_wait_since[0] != request_id
+        ):
+            self._admission_wait_since = (request_id, now)
+            logger.info(
+                "Prefetch request %s waits up to %.0f s for %.2f GiB of free L1",
+                request_id,
+                self._admission_wait_s,
+                request_bytes / (1 << 30),
+            )
+            return False
+        waited = now - self._admission_wait_since[1]
+        if waited >= self._admission_wait_s:
+            logger.warning(
+                "Prefetch request %s admitted after waiting %.1f s without "
+                "%.2f GiB of free L1; its reservation may fall short",
+                request_id,
+                waited,
+                request_bytes / (1 << 30),
+            )
+            return True
+        return False
+
+    def _target_l1_indices(self) -> set[int]:
+        """The L1 managers that live L2 adapters stage into."""
+        return {
+            self._l2_affinity[adapter_idx]
+            for adapter_idx in self._l2_adapters
+            if adapter_idx not in self._draining
+        }
 
     # =========================================================================
     # Lookup phase
